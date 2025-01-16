@@ -1,4 +1,7 @@
+using System.Diagnostics;
+using System.Drawing;
 using System.Runtime.InteropServices;
+using System.Windows.Forms;
 
 namespace GraphEditor
 {
@@ -12,11 +15,25 @@ namespace GraphEditor
 
     public partial class Form1 : Form
     {
+        public IntPtr hookId = IntPtr.Zero;
+
+        // Colors
+        readonly Color DarkBG = Color.FromArgb(26, 26, 26);
+        readonly Color ObjectBG = Color.FromArgb(31, 31, 31);
+
+        // AlignImageView sizes
+        readonly Size DefaultAlignSize = new Size(205, 205);
+        readonly Size LargeAlignSize = new Size(410, 410);
+
         // Image Directory
         string imageFilePath { set; get; }
 
         // Current Image
         Image currentImage { set; get; }
+        bool ImageLoaded { set; get; }
+
+        // Zoom view image
+        Bitmap zoomBMP = new Bitmap(205, 205);
 
         CoordinateState CurrentCoordinateState;
 
@@ -54,6 +71,35 @@ namespace GraphEditor
         [DllImport("DwmApi")]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, int[] attrValue, int attrSize);
 
+        public const int WH_KEYBOARD_LL = 13;
+        public const int WM_KEYDOWN = 0x0100;
+        public const int WM_KEYUP = 0x0101;
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        public static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        public delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        public IntPtr SetHook(LowLevelKeyboardProc proc)
+        {
+            using (Process curProcess = Process.GetCurrentProcess())
+            using (ProcessModule curModule = curProcess.MainModule)
+            {
+                return SetWindowsHookEx(WH_KEYBOARD_LL, proc,
+                    GetModuleHandle(curModule.ModuleName), 0);
+            }
+        }
+
         protected override void OnHandleCreated(EventArgs e)
         {
             if (DwmSetWindowAttribute(Handle, 19, new[] { 1 }, 4) != 0)
@@ -67,8 +113,12 @@ namespace GraphEditor
             // Center Picture Box
             PicturePanel_Resize(this, new EventArgs());
 
-            // Hide Coordinate Label
+            // Hide coordinate label and image align view
             CoordinateLabel.Visible = false;
+            AlignImageView.Visible = false;
+
+            // No image loaded yet
+            ImageLoaded = false;
 
             CurrentCoordinateState = CoordinateState.Coordinates;
         }
@@ -77,7 +127,7 @@ namespace GraphEditor
         {
             bool isInXRange = testPoint.X >= Math.Min(StartEdge.X, EndEdge.X) && testPoint.X <= Math.Max(StartEdge.X, EndEdge.X);
             bool isInYRange = testPoint.Y >= Math.Min(StartEdge.Y, EndEdge.Y) && testPoint.Y <= Math.Max(StartEdge.Y, EndEdge.Y);
-            
+
             return isInXRange && isInYRange;
         }
 
@@ -96,6 +146,29 @@ namespace GraphEditor
             return scale * Math.Round(d / scale, digits);
         }
 
+        public IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+            {
+                int vkCode = Marshal.ReadInt32(lParam);
+
+                if ((Keys)vkCode == Keys.LShiftKey || (Keys)vkCode == Keys.RShiftKey)
+                {
+                    if (wParam == (IntPtr)WM_KEYDOWN)
+                    {
+                        AlignImageView.Size = LargeAlignSize;
+                    }
+                    else if (wParam == (IntPtr)WM_KEYUP)
+                    {
+                        AlignImageView.Size = DefaultAlignSize;
+                        AlignImageView.Location = new Point(12, splitContainer1.Size.Height - 12 - AlignImageView.Size.Height);
+                    }
+                }
+            }
+
+            return CallNextHookEx(hookId, nCode, wParam, lParam);
+        }
+
         private void mainPictureBox_DoubleClick(object sender, EventArgs e)
         {
             using (OpenFileDialog openFileDialog = new OpenFileDialog())
@@ -105,11 +178,18 @@ namespace GraphEditor
 
                 if (openFileDialog.ShowDialog() == DialogResult.OK)
                 {
-                    imageFilePath = openFileDialog.FileName; // Save file path
-                    currentImage = Image.FromFile(imageFilePath); // Load image
-                    mainPictureBox.Image = currentImage; // Load into PictureBox
+                    // Save file path
+                    imageFilePath = openFileDialog.FileName;
+                    // Load image
+                    currentImage = Image.FromFile(imageFilePath);
+                    // Load into PictureBox
+                    mainPictureBox.Image = currentImage;
+
+                    // Enable controls
                     bSave.Enabled = true;
                     bCalibrate.Enabled = true;
+                    ImageLoaded = true;
+
                     PicturePanel_Resize(this, new EventArgs());
                 }
             }
@@ -177,6 +257,7 @@ namespace GraphEditor
         private void mainPictureBox_MouseEnter(object sender, EventArgs e)
         {
             CoordinateLabel.Visible = true;
+            if (ImageLoaded) AlignImageView.Visible = true;
         }
 
         private void mainPictureBox_MouseLeave(object sender, EventArgs e)
@@ -184,6 +265,7 @@ namespace GraphEditor
             if ((CurrentCoordinateState == CoordinateState.Coordinates) || (CurrentCoordinateState == CoordinateState.Units))
             {
                 CoordinateLabel.Visible = false;
+                AlignImageView.Visible = false;
             }
             else if (CurrentCoordinateState == CoordinateState.CalStart)
             {
@@ -199,6 +281,77 @@ namespace GraphEditor
 
         private void mainPictureBox_MouseMove(object sender, MouseEventArgs e)
         {
+            // Update zoomed view
+            if (ImageLoaded)
+            {
+                using (Graphics gfx = Graphics.FromImage(zoomBMP))
+                using (Bitmap CurrentImage_BMP = new Bitmap(currentImage))
+                {
+                    // Fill background
+                    using (Brush BGbrush = new SolidBrush(ObjectBG))
+                    {
+                        gfx.FillRectangle(BGbrush, 0, 0, zoomBMP.Width, zoomBMP.Height);
+                    }
+
+                    for (int x = 0; x < 41; x++)
+                    {
+                        int dx = x - 20;
+                        int imageX = e.Location.X + dx;
+                        // Check if x is within image
+                        if ((imageX >= 0) && (imageX < currentImage.Width))
+                        {
+                            for (int y = 0; y < 41; y++)
+                            {
+                                int dy = y - 20;
+                                int imageY = e.Location.Y + dy;
+
+                                if ((imageY >= 0) && (imageY < currentImage.Height))
+                                {
+                                    using (Brush pixelBrush = new SolidBrush(CurrentImage_BMP.GetPixel(imageX, imageY)))
+                                    {
+                                        gfx.FillRectangle(pixelBrush, 5 * x, 5 * y, 5, 5);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Add crosshair
+                    Rectangle[] OuterCrosshairRectangles =
+                    {
+                        // Top rect
+                        new Rectangle(101, 0, 3, 99),
+                        // Bottom rect
+                        new Rectangle(101, 106, 3, 99),
+                        // Left rect
+                        new Rectangle(0, 101, 99, 3),
+                        // Right rect
+                        new Rectangle(106, 101, 99, 3)
+                    };
+
+                    using (Brush OuterCrosshairBrush = new SolidBrush(Color.Black))
+                    {
+                        gfx.FillRectangles(OuterCrosshairBrush, OuterCrosshairRectangles);
+                    }
+
+                    using (Pen InnerCrosshairPen = new Pen(Color.White))
+                    {
+                        // Top line
+                        gfx.DrawLine(InnerCrosshairPen, 102.0f, 0.0f, 102.0f, 97.0f);
+                        // Bottom line
+                        gfx.DrawLine(InnerCrosshairPen, 102.0f, 107.0f, 102.0f, 204.0f);
+                        // Left line
+                        gfx.DrawLine(InnerCrosshairPen, 0.0f, 102.0f, 97.0f, 102.0f);
+                        // Right line
+                        gfx.DrawLine(InnerCrosshairPen, 107.0f, 102.0f, 204.0f, 102.0f);
+                    }
+                }
+
+                // Update AlignImageView control
+                AlignImageView.Image = zoomBMP;
+            }
+
+            // Update coordinate label
             switch (CurrentCoordinateState)
             {
                 case CoordinateState.Coordinates:
@@ -223,42 +376,48 @@ namespace GraphEditor
                                 Point GraphRelativeCursorLocation = PointToGraph(e.Location);
 
                                 // Calculate X data
-                                double xAxisStartValue = double.Parse(xAxisStartValueBox.Text);
-                                double xAxisEndValue = double.Parse(xAxisEndValueBox.Text);
-
                                 double xValue = 0.0;
                                 double xScale = (double)(GraphRelativeCursorLocation.X) / (double)GraphWidth;
                                 if (xAxisLogarithmic.Checked)
                                 {
                                     // X axis is logarithmic
+                                    double xAxisStartValue = Math.Log10(double.Parse(xAxisStartValueBox.Text));
+                                    double xAxisEndValue = Math.Log10(double.Parse(xAxisEndValueBox.Text));
 
+                                    xValue = Math.Pow(10, xAxisStartValue + xScale * (xAxisEndValue - xAxisStartValue));
                                 }
                                 else
                                 {
                                     // X axis is linear
+                                    double xAxisStartValue = double.Parse(xAxisStartValueBox.Text);
+                                    double xAxisEndValue = double.Parse(xAxisEndValueBox.Text);
+
                                     xValue = xScale * (xAxisEndValue - xAxisStartValue) + xAxisStartValue;
                                 }
 
                                 // Calculate Y data
-                                double yAxisStartValue = double.Parse(yAxisStartValueBox.Text);
-                                double yAxisEndValue = double.Parse(yAxisEndValueBox.Text);
-
                                 double yValue = 0.0;
                                 double yScale = (double)(GraphRelativeCursorLocation.Y) / (double)GraphHeight;
                                 if (yAxisLogarithmic.Checked)
                                 {
                                     // Y axis is logarithmic
+                                    double yAxisStartValue = Math.Log10(double.Parse(yAxisStartValueBox.Text));
+                                    double yAxisEndValue = Math.Log10(double.Parse(yAxisEndValueBox.Text));
 
+                                    yValue = Math.Pow(10, yAxisStartValue + yScale * (yAxisEndValue - yAxisStartValue));
                                 }
                                 else
                                 {
                                     // Y axis is linear
+                                    double yAxisStartValue = double.Parse(yAxisStartValueBox.Text);
+                                    double yAxisEndValue = double.Parse(yAxisEndValueBox.Text);
+
                                     yValue = yScale * (yAxisEndValue - yAxisStartValue) + yAxisStartValue;
                                 }
 
                                 // Update coordinate label
                                 CoordinateLabel.ForeColor = SystemColors.Control;
-                                CoordinateLabel.Text = "X: " + RoundToSignificantDigits(xValue, 3).ToString() + xAxisUnitBox.Text + " / Y: " + RoundToSignificantDigits(yValue, 3).ToString() + yAxisUnitBox.Text;
+                                CoordinateLabel.Text = "X: " + RoundToSignificantDigits(xValue, 3).ToString("G15") + xAxisUnitBox.Text + " / Y: " + RoundToSignificantDigits(yValue, 3).ToString("G15") + yAxisUnitBox.Text;
                             }
                             else
                             {
@@ -278,7 +437,6 @@ namespace GraphEditor
                         CoordinateLabel.ForeColor = Color.Red;
                         CoordinateLabel.Text = "Some axis parameters are missing!";
                     }
-
                     break;
             }
         }
