@@ -157,6 +157,7 @@ namespace GraphEditor
                     if (wParam == (IntPtr)WM_KEYDOWN)
                     {
                         AlignImageView.Size = LargeAlignSize;
+                        AlignImageView.Location = new Point(12, splitContainer1.Size.Height - 12 - AlignImageView.Size.Height);
                     }
                     else if (wParam == (IntPtr)WM_KEYUP)
                     {
